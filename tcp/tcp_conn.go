@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,35 +9,102 @@ import (
 	"hash"
 	"io"
 	"net"
+	"strings"
 	"sync"
 )
 
 // Conn 是你需要实现的一种连接类型，它支持下面描述的若干接口；
 // 为了实现这些接口，你需要设计一个基于 TCP 的简单协议；
 type Conn struct {
+	mainConn net.Conn
+	bufferRW *bufio.ReadWriter
+	lock     sync.Mutex
 }
 
 // Send 传入一个 key 表示发送者将要传输的数据对应的标识；
 // 返回 writer 可供发送者分多次写入大量该 key 对应的数据；
 // 当发送者已将该 key 对应的所有数据写入后，调用 writer.Close 告知接收者：该 key 的数据已经完全写入；
 func (conn *Conn) Send(key string) (writer io.WriteCloser, err error) {
-	return nil, nil
+	conn.lock.Lock()
+	defer conn.lock.Unlock()
+
+	_, err = conn.mainConn.Write([]byte(fmt.Sprintf("SEND.KEY %s\n", key)))
+	if err != nil {
+		return nil, err
+	}
+
+	return &connWriter{conn: conn, key: key}, nil
 }
 
 // Receive 返回一个 key 表示接收者将要接收到的数据对应的标识；
 // 返回的 reader 可供接收者多次读取该 key 对应的数据；
 // 当 reader 返回 io.EOF 错误时，表示接收者已经完整接收该 key 对应的数据；
 func (conn *Conn) Receive() (key string, reader io.Reader, err error) {
-	return "", nil, nil
+	conn.lock.Lock()
+	defer conn.lock.Unlock()
+
+	line, err := conn.bufferRW.ReadString('\n')
+	if err != nil {
+		return "", nil, err
+	}
+	parts := strings.SplitN(strings.TrimSpace(line), " ", 2)
+	if len(parts) == 2 && parts[0] == "SEND.KEY" {
+		reader := &connReader{conn: conn, key: key}
+		return parts[1], reader, nil
+	} else {
+		return "", nil, nil
+	}
 }
 
 // Close 关闭你实现的连接对象及其底层的 TCP 连接
 func (conn *Conn) Close() {
+	conn.mainConn.Close()
 }
 
 // NewConn 从一个 TCP 连接得到一个你实现的连接对象
 func NewConn(conn net.Conn) *Conn {
-	return nil
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+	return &Conn{
+		mainConn: conn,
+		bufferRW: bufio.NewReadWriter(reader, writer),
+	}
+}
+
+type connWriter struct {
+	conn *Conn
+	key  string
+}
+
+func (c connWriter) Write(p []byte) (n int, err error) {
+	n, err = c.conn.bufferRW.Write(p)
+	if err != nil {
+		return n, err
+	}
+	err = c.conn.bufferRW.Flush()
+	return n, err
+}
+
+func (c connWriter) Close() error {
+	c.conn.bufferRW.Write([]byte(fmt.Sprintf("END.EOF %s\n", c.key)))
+	return c.conn.bufferRW.Flush()
+}
+
+type connReader struct {
+	conn *Conn
+	key  string
+}
+
+func (c connReader) Read(p []byte) (n int, err error) {
+	n, err = c.conn.bufferRW.Read(p)
+	if err != nil {
+		return n, err
+	}
+	if strings.Contains(string(p[:n]), fmt.Sprintf("END.EOF %s\n", c.key)) {
+		index := strings.Index(string(p[:n]), fmt.Sprintf("END.EOF %s\n", c.key))
+		return index, io.EOF
+	}
+	return n, err
 }
 
 // 除了上面规定的接口，你还可以自行定义新的类型，变量和函数以满足实现需求
